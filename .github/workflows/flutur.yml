@@ -91,6 +91,21 @@ jobs:
           fi
           flutter pub get
 
+      - name: Upgrade Gradle wrapper (kalau terlalu lama)
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          WP=android/gradle/wrapper/gradle-wrapper.properties
+          MIN="8.14.3"
+          if [ -f "$WP" ]; then
+            CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$WP" | head -1 | sed 's/gradle-//')
+            echo "Gradle project: ${CUR:-tidak terdeteksi}"
+            if [ -n "$CUR" ] && [ "$(printf '%s\n%s\n' "$CUR" "$MIN" | sort -V | head -1)" != "$MIN" ]; then
+              sed -i -E "s#gradle-[0-9]+(\.[0-9]+)*-(all|bin)\.zip#gradle-${MIN}-all.zip#" "$WP"
+              echo "Gradle dinaikkan ke $MIN"
+            fi
+          fi
+
       - name: Build APK
         env:
           BUILD_MODE: ${{ steps.p.outputs.mode }}
@@ -114,4 +129,3 @@ jobs:
           path: out/*.apk
           retention-days: 1
           if-no-files-found: error
-
