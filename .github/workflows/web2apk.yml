@@ -1,1 +1,263 @@
+name: Build Web2APK
+
+# Dipanggil oleh bot lewat workflow_dispatch.
+# Kontrak input sama dengan server.js: jobId, userId, payload (JSON string)
+# payload: {"mode":"url","url":"https://...","appName":"Nama App","iconUrl":"https://.../icon.png"}
+# Hasil: artifact bernama apk-<jobId> berisi file .apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ID unik job (nama artifact: apk-<jobId>)"
+        required: true
+        type: string
+      userId:
+        description: "ID user (opsional)"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "JSON payload dari bot"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: web2apk-${{ inputs.jobId }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Parse payload
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+
+          c = json.loads(os.environ["PAYLOAD"])
+          url = (c.get("url") or "").strip()
+          if not url:
+              raise SystemExit("::error::payload.url kosong")
+          if not re.match(r"^https?://", url, re.I):
+              url = "https://" + url
+
+          name = re.sub(r"[\r\n\t]+", " ", (c.get("appName") or "").strip()) or "Web App"
+          name = name[:50]
+          icon = (c.get("iconUrl") or "").strip()
+
+          slug = re.sub(r"[^a-z0-9]", "", name.lower())[:20] or "app"
+          proj = "app_" + slug
+
+          json.dump({"url": url, "name": name, "icon": icon, "proj": proj}, open("cfg.json", "w"))
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"PROJ={proj}\n")
+          print("URL :", url)
+          print("Nama:", name)
+          print("Pkg : com.w2a." + proj)
+          PY
+
+      - name: Create Flutter project
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics >/dev/null 2>&1 || true
+          flutter create --org com.w2a --platforms=android --project-name "$PROJ" webapp
+          cd webapp
+          flutter pub add webview_flutter
+          flutter pub add --dev flutter_launcher_icons
+
+      - name: Generate app code & manifest
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, re
+
+          cfg = json.load(open("cfg.json"))
+
+          def dq(s):
+              # string literal Dart yang aman ($ tidak di-interpolasi)
+              return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$") + '"'
+
+          dart = r"""import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const String kStartUrl = __URL__;
+          const String kAppTitle = __TITLE__;
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const App());
+          }
+
+          class App extends StatelessWidget {
+            const App({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: kAppTitle,
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+                home: const WebPage(),
+              );
+            }
+          }
+
+          class WebPage extends StatefulWidget {
+            const WebPage({super.key});
+
+            @override
+            State<WebPage> createState() => _WebPageState();
+          }
+
+          class _WebPageState extends State<WebPage> {
+            late final WebViewController _c;
+            int _progress = 0;
+            bool _error = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _c = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(NavigationDelegate(
+                  onPageStarted: (_) => setState(() => _error = false),
+                  onProgress: (p) => setState(() => _progress = p),
+                  onWebResourceError: (e) {
+                    if (e.isForMainFrame == true) setState(() => _error = true);
+                  },
+                ))
+                ..loadRequest(Uri.parse(kStartUrl));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return PopScope(
+                canPop: false,
+                onPopInvokedWithResult: (didPop, result) async {
+                  if (didPop) return;
+                  if (await _c.canGoBack()) {
+                    await _c.goBack();
+                  } else {
+                    SystemNavigator.pop();
+                  }
+                },
+                child: Scaffold(
+                  body: SafeArea(
+                    child: Stack(
+                      children: [
+                        WebViewWidget(controller: _c),
+                        if (_progress < 100 && !_error)
+                          LinearProgressIndicator(value: _progress / 100),
+                        if (_error)
+                          Container(
+                            color: Theme.of(context).colorScheme.surface,
+                            alignment: Alignment.center,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.wifi_off, size: 56),
+                                const SizedBox(height: 12),
+                                const Text('Gagal memuat halaman'),
+                                const SizedBox(height: 12),
+                                FilledButton(
+                                  onPressed: () {
+                                    setState(() => _error = false);
+                                    _c.loadRequest(Uri.parse(kStartUrl));
+                                  },
+                                  child: const Text('Coba lagi'),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          """
+          import textwrap
+          dart = textwrap.dedent(dart)
+          dart = dart.replace("__URL__", dq(cfg["url"])).replace("__TITLE__", dq(cfg["name"]))
+          open("webapp/lib/main.dart", "w", encoding="utf-8").write(dart)
+
+          # AndroidManifest: label, INTERNET, cleartext
+          mp = "webapp/android/app/src/main/AndroidManifest.xml"
+          m = open(mp, encoding="utf-8").read()
+          label = (cfg["name"].replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;").replace('"', "&quot;"))
+          m = re.sub(r'android:label="[^"]*"', 'android:label="%s"' % label.replace("\\", "\\\\"), m, count=1)
+          if "android.permission.INTERNET" not in m:
+              m = m.replace("<application",
+                            '<uses-permission android:name="android.permission.INTERNET"/>\n    <application', 1)
+          if "usesCleartextTraffic" not in m:
+              m = m.replace("<application", '<application android:usesCleartextTraffic="true"', 1)
+          open(mp, "w", encoding="utf-8").write(m)
+          print("main.dart & manifest siap")
+          PY
+
+      - name: Setup icon (opsional)
+        run: |
+          set -uo pipefail
+          ICON=$(python3 -c "import json;print(json.load(open('cfg.json'))['icon'])")
+          if [ -z "$ICON" ]; then
+            echo "Tidak ada iconUrl, pakai icon default Flutter"
+            exit 0
+          fi
+          cd webapp
+          mkdir -p assets
+          if curl -fsSL --retry 3 --retry-delay 2 -o assets/icon_raw "$ICON"; then
+            # pastikan PNG persegi 512x512
+            convert assets/icon_raw -resize 512x512 -background none -gravity center -extent 512x512 png:assets/icon.png \
+              || cp assets/icon_raw assets/icon.png
+            rm -f assets/icon_raw
+            printf '\nflutter_launcher_icons:\n  android: true\n  ios: false\n  image_path: "assets/icon.png"\n  min_sdk_android: 21\n' >> pubspec.yaml
+            flutter pub get
+            dart run flutter_launcher_icons || echo "::warning::Gagal generate icon, pakai icon default"
+          else
+            echo "::warning::Gagal download icon, pakai icon default"
+          fi
+          exit 0
+
+      - name: Build APK
+        run: |
+          set -euo pipefail
+          cd webapp
+          flutter build apk --release --target-platform android-arm,android-arm64
+
+      - name: Kumpulkan APK
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find webapp/build/app/outputs -name '*.apk' -exec cp {} out/ \;
+          ls -lh out
+          [ -n "$(ls -A out)" ] || { echo "::error::APK tidak ditemukan"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: out/*.apk
+          retention-days: 1
+          if-no-files-found: error
 
