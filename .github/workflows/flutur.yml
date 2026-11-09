@@ -1,1 +1,117 @@
+name: Build Flutter APK (ZIP)
+
+# Dipanggil oleh bot lewat workflow_dispatch.
+# Kontrak input sama dengan server.js: jobId, userId, payload (JSON string)
+# payload: {"mode":"zip","url":"<link zip>","buildType":"release|debug","tag":"...","flutterVersion":"(opsional)"}
+# Hasil: artifact bernama apk-<jobId> berisi file .apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: "ID unik job (nama artifact: apk-<jobId>)"
+        required: true
+        type: string
+      userId:
+        description: "ID user (opsional)"
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: "JSON payload dari bot"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build-${{ inputs.jobId }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Parse payload
+        id: p
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
+          URL=$(jq -r '.url // empty' <<<"$PAYLOAD")
+          MODE=$(jq -r '.buildType // "release"' <<<"$PAYLOAD")
+          FV=$(jq -r '.flutterVersion // empty' <<<"$PAYLOAD")
+          [ -n "$URL" ] || { echo "::error::payload.url kosong"; exit 1; }
+          case "$MODE" in release|debug) ;; *) MODE=release ;; esac
+          {
+            echo "url=$URL"
+            echo "mode=$MODE"
+            echo "fv=$FV"
+          } >> "$GITHUB_OUTPUT"
+          echo "Mode build: $MODE"
+
+      - name: Download & extract source
+        env:
+          SRC_URL: ${{ steps.p.outputs.url }}
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          curl -fsSL --retry 5 --retry-delay 3 -o src.zip "$SRC_URL"
+          unzip -q -o src.zip -d src
+          rm -rf src/__MACOSX
+          PUB=$(find src -maxdepth 4 -name pubspec.yaml -not -path '*/.*' -not -path '*/build/*' \
+                | awk '{print length($0) " " $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          [ -n "$PUB" ] || { echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP"; exit 1; }
+          APP_DIR=$(cd "$(dirname "$PUB")" && pwd)
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Project ditemukan di: $APP_DIR"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.p.outputs.fv }}
+          cache: true
+
+      - name: Flutter pub get
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          flutter config --no-analytics >/dev/null 2>&1 || true
+          # Kalau folder android hilang dari ZIP, generate ulang
+          if [ ! -d android ]; then
+            NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d "\"'")
+            flutter create --platforms=android --project-name "$NAME" .
+          fi
+          flutter pub get
+
+      - name: Build APK
+        env:
+          BUILD_MODE: ${{ steps.p.outputs.mode }}
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          flutter build apk "--$BUILD_MODE" --no-tree-shake-icons
+
+      - name: Kumpulkan APK
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find "$APP_DIR/build/app/outputs" -name '*.apk' -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          ls -lh "$GITHUB_WORKSPACE/out"
+          [ -n "$(ls -A "$GITHUB_WORKSPACE/out")" ] || { echo "::error::APK tidak ditemukan"; exit 1; }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: out/*.apk
+          retention-days: 1
+          if-no-files-found: error
 
