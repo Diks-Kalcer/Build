@@ -106,13 +106,61 @@ jobs:
             fi
           fi
 
-      - name: Build APK
+      - name: Opt-out DSL baru AGP 9 (kompatibel dengan plugin Flutter)
+        run: |
+          set -euo pipefail
+          cd "$APP_DIR"
+          GP=android/gradle.properties
+          mkdir -p android && touch "$GP"
+          if grep -q '^android\.newDsl=' "$GP"; then
+            sed -i 's/^android\.newDsl=.*/android.newDsl=false/' "$GP"
+          else
+            printf '\nandroid.newDsl=false\n' >> "$GP"
+          fi
+          echo "== android/gradle.properties =="
+          cat "$GP"
+
+      - name: Build APK (Flutter stable)
+        id: build1
+        continue-on-error: true
         env:
           BUILD_MODE: ${{ steps.p.outputs.mode }}
         run: |
           set -euo pipefail
           cd "$APP_DIR"
-          flutter build apk "--$BUILD_MODE" --no-tree-shake-icons
+          flutter build apk "--$BUILD_MODE" --no-tree-shake-icons --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build1.log"
+
+      - name: Build APK (fallback Flutter lama)
+        if: steps.build1.outcome == 'failure'
+        env:
+          BUILD_MODE: ${{ steps.p.outputs.mode }}
+        run: |
+          set +e
+          cd "$APP_DIR"
+          summary() {
+            echo "=== Error build utama (Flutter stable) ==="
+            grep -E -A8 "What went wrong|Error:|error:" "$GITHUB_WORKSPACE/build1.log" | head -30
+          }
+          for V in 3.35.7 3.32.8 3.29.3; do
+            echo "::group::Coba Flutter $V"
+            D="$RUNNER_TEMP/flutter-$V"
+            if git clone --depth 1 -b "$V" https://github.com/flutter/flutter.git "$D" >/dev/null 2>&1; then
+              export PATH="$D/bin:$PATH"
+              flutter config --no-analytics >/dev/null 2>&1
+              rm -rf .dart_tool build
+              if flutter pub get && flutter build apk "--$BUILD_MODE" --no-tree-shake-icons; then
+                echo "::endgroup::"
+                echo "Berhasil dengan Flutter $V"
+                exit 0
+              fi
+            else
+              echo "Gagal clone Flutter $V"
+            fi
+            echo "::endgroup::"
+          done
+          summary
+          echo "::error::Semua percobaan build gagal"
+          exit 1
 
       - name: Kumpulkan APK
         run: |
