@@ -1,467 +1,208 @@
-
 name: Build Web2APK
 
 on:
   workflow_dispatch:
     inputs:
-      jobId:
-        description: "ID unik job"
+      zip_url:
+        description: "URL download ZIP project"
         required: true
         type: string
-      userId:
-        description: "ID user"
-        required: false
-        default: "0"
-        type: string
-      payload:
-        description: "JSON payload dari bot"
+      tag:
+        description: "Tag build"
         required: true
         type: string
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+        type: choice
+        options: [debug, release]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: web2apk-${{ inputs.jobId }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
 
     steps:
-      # =========================
-      # CHECKOUT
-      # =========================
       - name: Checkout
         uses: actions/checkout@v4
 
-      # =========================
-      # JAVA
-      # =========================
       - name: Setup Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      # =========================
-      # FLUTTER
-      # =========================
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: "3.41.9"
           channel: stable
           cache: true
 
-      # =========================
-      # INSTALL TOOLS
-      # =========================
-      - name: Install ImageMagick
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y imagemagick
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
-      # =========================
-      # PARSE PAYLOAD
-      # =========================
-      - name: Parse payload
+      - name: Download ZIP
         env:
-          PAYLOAD: ${{ inputs.payload }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
         run: |
           set -euo pipefail
-
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from urllib.parse import urlparse
-
-          cfg = json.loads(os.environ["PAYLOAD"])
-
-          mode = str(cfg.get("mode") or "url").lower()
-
-          if mode != "url":
-              raise SystemExit("::error::Mode hanya mendukung url")
-
-          url = str(cfg.get("url") or "").strip()
-
-          if not url:
-              raise SystemExit("::error::URL kosong")
-
-          if not re.match(r"^https?://", url, re.I):
-              url = "https://" + url
-
-          parsed = urlparse(url)
-
-          if parsed.scheme not in ("http", "https") or not parsed.hostname:
-              raise SystemExit("::error::URL tidak valid")
-
-          name = str(cfg.get("appName") or "Web App")
-          name = re.sub(r"[\r\n\t]+", " ", name).strip()
-          name = name[:50] or "Web App"
-
-          icon = str(cfg.get("iconUrl") or "").strip()
-
-          if icon and not re.match(r"^https?://", icon, re.I):
-              raise SystemExit("::error::iconUrl harus HTTP/HTTPS")
-
-          with open("cfg.json", "w", encoding="utf-8") as f:
-              json.dump({
-                  "url": url,
-                  "name": name,
-                  "icon": icon
-              }, f)
-
-          print("App Name:", name)
-          print("URL:", url)
-          print("Icon:", "Custom" if icon else "Default")
-          PY
-
-      # =========================
-      # CREATE FLUTTER PROJECT
-      # =========================
-      - name: Create Flutter project
-        run: |
-          set -euo pipefail
-
-          flutter config --no-analytics
-
-          flutter create \
-            --org com.w2a \
-            --platforms=android \
-            --project-name webapp \
-            webapp
-
-          cd webapp
-
-          flutter pub add webview_flutter
-          flutter pub add --dev flutter_launcher_icons
-
-      # =========================
-      # GRADLE CACHE
-      # =========================
-      - name: Setup Gradle Cache
-        uses: gradle/actions/setup-gradle@v4
-
-      # =========================
-      # GENERATE MAIN DART
-      # =========================
-      - name: Generate app code and manifest
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import json
-          import re
-          import html
-          import textwrap
-
-          cfg = json.load(open("cfg.json", encoding="utf-8"))
-
-          def dart_string(value):
-              return json.dumps(value, ensure_ascii=True)
-
-          dart = r'''
-          import 'package:flutter/material.dart';
-          import 'package:flutter/services.dart';
-          import 'package:webview_flutter/webview_flutter.dart';
-
-          const String kStartUrl = __URL__;
-          const String kAppTitle = __TITLE__;
-
-          void main() {
-            WidgetsFlutterBinding.ensureInitialized();
-            runApp(const App());
-          }
-
-          class App extends StatelessWidget {
-            const App({super.key});
-
-            @override
-            Widget build(BuildContext context) {
-              return MaterialApp(
-                title: kAppTitle,
-                debugShowCheckedModeBanner: false,
-                theme: ThemeData(
-                  useMaterial3: true,
-                  colorSchemeSeed: Colors.blue,
-                ),
-                home: const WebPage(),
-              );
-            }
-          }
-
-          class WebPage extends StatefulWidget {
-            const WebPage({super.key});
-
-            @override
-            State<WebPage> createState() => _WebPageState();
-          }
-
-          class _WebPageState extends State<WebPage> {
-            late final WebViewController controller;
-
-            int progress = 0;
-            bool hasError = false;
-
-            @override
-            void initState() {
-              super.initState();
-
-              controller = WebViewController()
-                ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                ..setNavigationDelegate(
-                  NavigationDelegate(
-                    onPageStarted: (_) {
-                      if (mounted) {
-                        setState(() => hasError = false);
-                      }
-                    },
-                    onProgress: (value) {
-                      if (mounted) {
-                        setState(() => progress = value);
-                      }
-                    },
-                    onWebResourceError: (error) {
-                      if (error.isForMainFrame == true && mounted) {
-                        setState(() => hasError = true);
-                      }
-                    },
-                  ),
-                )
-                ..loadRequest(Uri.parse(kStartUrl));
-            }
-
-            Future<void> handleBack() async {
-              if (await controller.canGoBack()) {
-                await controller.goBack();
-              } else {
-                SystemNavigator.pop();
-              }
-            }
-
-            @override
-            Widget build(BuildContext context) {
-              return PopScope(
-                canPop: false,
-                onPopInvokedWithResult: (didPop, result) async {
-                  if (!didPop) {
-                    await handleBack();
-                  }
-                },
-                child: Scaffold(
-                  body: SafeArea(
-                    child: Stack(
-                      children: [
-                        WebViewWidget(controller: controller),
-
-                        if (progress < 100 && !hasError)
-                          LinearProgressIndicator(
-                            value: progress / 100,
-                          ),
-
-                        if (hasError)
-                          Container(
-                            color: Theme.of(context).colorScheme.surface,
-                            alignment: Alignment.center,
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Icon(
-                                  Icons.wifi_off,
-                                  size: 56,
-                                ),
-                                const SizedBox(height: 12),
-                                const Text(
-                                  'Gagal memuat halaman',
-                                ),
-                                const SizedBox(height: 12),
-                                FilledButton(
-                                  onPressed: () {
-                                    setState(() {
-                                      hasError = false;
-                                    });
-
-                                    controller.loadRequest(
-                                      Uri.parse(kStartUrl),
-                                    );
-                                  },
-                                  child: const Text('Coba lagi'),
-                                ),
-                              ],
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-              );
-            }
-          }
-          '''
-
-          dart = textwrap.dedent(dart)
-          dart = dart.replace("__URL__", dart_string(cfg["url"]))
-          dart = dart.replace("__TITLE__", dart_string(cfg["name"]))
-
-          with open("webapp/lib/main.dart", "w", encoding="utf-8") as f:
-              f.write(dart)
-
-          manifest = "webapp/android/app/src/main/AndroidManifest.xml"
-
-          with open(manifest, encoding="utf-8") as f:
-              content = f.read()
-
-          label = html.escape(cfg["name"], quote=True)
-
-          content = re.sub(
-              r'android:label="[^"]*"',
-              lambda m: 'android:label="' + label + '"',
-              content,
-              count=1
-          )
-
-          if "android.permission.INTERNET" not in content:
-              content = content.replace(
-                  "<application",
-                  '<uses-permission android:name="android.permission.INTERNET"/>\n'
-                  "    <application",
-                  1
-              )
-
-          if "usesCleartextTraffic" not in content:
-              content = content.replace(
-                  "<application",
-                  '<application android:usesCleartextTraffic="true"',
-                  1
-              )
-
-          with open(manifest, "w", encoding="utf-8") as f:
-              f.write(content)
-
-          print("Main Dart generated")
-          print("Manifest updated")
-          PY
-
-      # =========================
-      # CUSTOM ICON
-      # =========================
-      - name: Setup app icon
-        continue-on-error: true
-        run: |
-          set -euo pipefail
-
-          ICON=$(python3 -c \
-            "import json; print(json.load(open('cfg.json'))['icon'])")
-
-          if [ -z "$ICON" ]; then
-            echo "Using default icon"
-            exit 0
-          fi
-
-          cd webapp
-
-          mkdir -p assets
-
-          if ! curl -fL --retry 3 \
-            --max-time 30 \
-            -o assets/icon_raw "$ICON"; then
-            echo "::warning::Icon download failed"
-            exit 0
-          fi
-
-          if ! identify assets/icon_raw >/dev/null 2>&1; then
-            echo "::warning::Invalid icon file"
-            exit 0
-          fi
-
-          convert assets/icon_raw \
-            -resize 512x512 \
-            -background none \
-            -gravity center \
-            -extent 512x512 \
-            PNG32:assets/icon.png
-
-          rm -f assets/icon_raw
-
-          cat >> pubspec.yaml <<'YAML'
-
-          flutter_launcher_icons:
-            android: true
-            ios: false
-            image_path: assets/icon.png
-            min_sdk_android: 21
-          YAML
-
-          flutter pub get
-          dart run flutter_launcher_icons
-
-      # =========================
-      # VALIDATE PROJECT
-      # =========================
-      - name: Validate project
-        run: |
-          set -euo pipefail
-
-          cd webapp
-
-          flutter doctor -v
-          flutter pub get
-
-          # Remove default test that references MyApp
-          rm -f test/widget_test.dart
-
-          dart format lib/main.dart
-
-          flutter analyze --no-pub
-
-      # =========================
-      # BUILD APK
-      # =========================
-      - name: Build APK
-        run: |
-          set -euo pipefail
-
-          cd webapp
-
-          flutter clean
-          flutter pub get
-
-          flutter build apk \
-            --release \
-            --target-platform android-arm,android-arm64 \
-            --verbose
-
-      # =========================
-      # COLLECT APK
-      # =========================
-      - name: Collect APK
-        if: success()
-        run: |
-          set -euo pipefail
-
-          mkdir -p out
-
-          find webapp/build/app/outputs \
-            -type f \
-            -name '*.apk' \
-            -exec cp {} out/ \;
-
-          echo "APK output:"
-          ls -lh out
-
-          if ! find out -name '*.apk' | grep -q .; then
-            echo "::error::APK tidak ditemukan"
+          rm -f project.zip
+
+          for token in "$GH_TOKEN" ""; do
+            if [ -n "$token" ]; then
+              curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 15 \
+                -H "Authorization: Bearer $token" \
+                -H "Accept: application/octet-stream" \
+                "${{ github.event.inputs.zip_url }}" -o project.zip 2>/dev/null || rm -f project.zip
+            else
+              curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 15 \
+                "${{ github.event.inputs.zip_url }}" -o project.zip 2>/dev/null || rm -f project.zip
+            fi
+            [ -s project.zip ] && unzip -tq project.zip >/dev/null 2>&1 && break
+            rm -f project.zip
+          done
+
+          [ -s project.zip ] && unzip -tq project.zip >/dev/null 2>&1 || {
+            echo "::error::ZIP tidak valid atau tidak dapat diunduh"
             exit 1
+          }
+          echo "ZIP OK: $(du -h project.zip | cut -f1)"
+
+      - name: Extract ZIP
+        run: |
+          set -euo pipefail
+          rm -rf project_raw
+          unzip -oq project.zip -d project_raw
+
+          SUB=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILES=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+          if [ "$SUB" -eq 1 ] && [ "$FILES" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d -print -quit)
+          else
+            PROJECT_DIR="project_raw"
           fi
 
-      # =========================
-      # UPLOAD APK
-      # =========================
-      - name: Upload APK
-        if: success()
+          [ -f "$PROJECT_DIR/pubspec.yaml" ] || {
+            echo "::error::pubspec.yaml tidak ditemukan"
+            find project_raw -maxdepth 2 | head -40
+            exit 1
+          }
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Fix Android environment
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+
+          # Gradle executable bit
+          [ ! -f "$PROJECT_DIR/android/gradlew" ] || chmod +x "$PROJECT_DIR/android/gradlew"
+
+          # gradle.properties defaults
+          mkdir -p "$PROJECT_DIR/android"
+          touch "$PROJECT_DIR/android/gradle.properties"
+          grep -q '^android.useAndroidX=' "$PROJECT_DIR/android/gradle.properties" || echo 'android.useAndroidX=true' >> "$PROJECT_DIR/android/gradle.properties"
+          grep -q '^android.enableJetifier=' "$PROJECT_DIR/android/gradle.properties" || echo 'android.enableJetifier=true' >> "$PROJECT_DIR/android/gradle.properties"
+          grep -q '^org.gradle.jvmargs=' "$PROJECT_DIR/android/gradle.properties" || echo 'org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8' >> "$PROJECT_DIR/android/gradle.properties"
+
+          # NDK auto-install
+          NDK_VER="$(grep -RhoE "ndkVersion[[:space:]]*[=:][[:space:]]*['\"][0-9]+\.[0-9]+\.[0-9]+['\"]" "$PROJECT_DIR/android" 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+          NDK_VER="${NDK_VER:-28.2.13676358}"
+          if [ ! -f "$SDK/ndk/$NDK_VER/source.properties" ]; then
+            sdkmanager "ndk;$NDK_VER" >/dev/null 2>&1 || true
+          fi
+
+          # compileSdk auto-install
+          COMPILE_SDK="$(grep -RhoE "compileSdk(Version)?[[:space:]]*[=:]?[[:space:]]*[0-9]+" "$PROJECT_DIR/android" 2>/dev/null | grep -Eo '[0-9]+' | tail -n1 || true)"
+          [ -z "$COMPILE_SDK" ] || yes | sdkmanager "platforms;android-$COMPILE_SDK" >/dev/null 2>&1 || true
+
+          # auto namespace
+          APP_GRADLE="$PROJECT_DIR/android/app/build.gradle"
+          if [ -f "$APP_GRADLE" ] && ! grep -qE '^\s*namespace' "$APP_GRADLE"; then
+            PKG="$(grep -RhoE 'package="[A-Za-z][A-Za-z0-9_.]*"' "$PROJECT_DIR/android/app/src/main/AndroidManifest.xml" 2>/dev/null | sed -E 's/package="(.*)"/\1/' | head -n1 || true)"
+            [ -z "$PKG" ] && PKG="$(grep -Eo 'applicationId[[:space:]]+"[A-Za-z][A-Za-z0-9_.]+"' "$APP_GRADLE" | sed -E 's/.*"(.*)"/\1/' | head -n1 || true)"
+            [ -n "$PKG" ] && sed -i "/^[[:space:]]*android[[:space:]]*{/a\\    namespace \"$PKG\"" "$APP_GRADLE" && echo "AUTO-FIX namespace=$PKG"
+          fi
+
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: ${{ runner.os }}-pub-
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          flutter config --no-analytics >/dev/null 2>&1 || true
+          for i in 1 2 3; do
+            flutter pub get && break || { echo "pub get retry $i/3"; sleep $((i*2)); }
+          done
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=true -Dorg.gradle.parallel=true -Dorg.gradle.caching=true -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+        run: |
+          set -euo pipefail
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          flutter clean >/dev/null 2>&1 || true
+
+          if [ "$BUILD_TYPE" = "release" ]; then
+            flutter build apk --release --target-platform android-arm64 --no-pub 2>&1 | tee build.log || {
+              echo "::error::Build RELEASE gagal, lihat log di atas"
+              exit 1
+            }
+          else
+            flutter build apk --debug --no-pub 2>&1 | tee build.log || {
+              echo "::error::Build DEBUG gagal, lihat log di atas"
+              exit 1
+            }
+          fi
+
+          APK="$(find build/app/outputs/flutter-apk -name '*.apk' -type f | head -n1)"
+          [ -n "$APK" ] || { echo "::error::APK tidak ditemukan setelah build"; exit 1; }
+          mkdir -p build/out
+          cp "$APK" build/out/app-release.apk
+          echo "APK_PATH=$PROJECT_DIR/build/out/app-release.apk" >> "$GITHUB_ENV"
+          echo "BUILD OK: $(du -h build/out/app-release.apk | cut -f1)"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.jobId }}
-          path: out/*.apk
-          retention-days: 1
+          name: apk-${{ github.event.inputs.tag }}
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload to GitHub Release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          APK="${{ env.APK_PATH }}"
+          test -s "$APK"
+
+          # Pastikan release ada
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --notes "Auto build by BuildApkDiks"
+
+          # Upload (replace jika sudah ada)
+          gh release upload "$TAG" "$APK" --clobber
+          echo "RELEASE UPLOAD OK: $TAG"
