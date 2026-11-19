@@ -1,3 +1,4 @@
+
 name: Build Web2APK
 
 on:
@@ -35,7 +36,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -70,9 +70,7 @@ jobs:
           if not re.match(r"^https?://", url, re.I):
               url = "https://" + url
 
-          parsed = urlparse(url)
-
-          if not parsed.hostname:
+          if not urlparse(url).hostname:
               raise SystemExit("::error::URL tidak valid")
 
           name = str(cfg.get("appName") or "Web App")
@@ -89,15 +87,13 @@ jobs:
 
           proj = "app_" + slug
 
-          data = {
-              "url": url,
-              "name": name,
-              "icon": icon,
-              "proj": proj
-          }
-
           with open("cfg.json", "w") as f:
-              json.dump(data, f)
+              json.dump({
+                  "url": url,
+                  "name": name,
+                  "icon": icon,
+                  "proj": proj
+              }, f)
 
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"PROJ={proj}\n")
@@ -114,7 +110,7 @@ jobs:
 
           flutter create \
             --org com.w2a \
-            --platforms android \
+            --platforms=android \
             --project-name "$PROJ" \
             webapp
 
@@ -122,6 +118,9 @@ jobs:
 
           flutter pub add webview_flutter
           flutter pub add --dev flutter_launcher_icons
+
+      - name: Setup Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Generate app code and manifest
         run: |
@@ -240,8 +239,7 @@ jobs:
                         if (hasError)
                           Container(
                             color: Theme.of(context)
-                                .colorScheme
-                                .surface,
+                                .colorScheme.surface,
                             alignment: Alignment.center,
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
@@ -330,7 +328,7 @@ jobs:
             "import json; print(json.load(open('cfg.json'))['icon'])")
 
           if [ -z "$ICON" ]; then
-            echo "Icon default Flutter digunakan"
+            echo "Menggunakan icon default"
             exit 0
           fi
 
@@ -346,7 +344,7 @@ jobs:
           fi
 
           if ! identify assets/icon_raw >/dev/null 2>&1; then
-            echo "::warning::File icon tidak valid"
+            echo "::warning::Icon tidak valid"
             exit 0
           fi
 
@@ -404,7 +402,6 @@ jobs:
             -name '*.apk' \
             -exec cp {} out/ \;
 
-          echo "Hasil APK:"
           ls -lh out
 
           if ! find out -name '*.apk' | grep -q .; then
