@@ -1,9 +1,16 @@
 name: Build Flutter APK (ZIP)
 
-# Dipanggil oleh bot lewat workflow_dispatch.
-# Kontrak input sama dengan server.js: jobId, userId, payload (JSON string)
-# payload: {"mode":"zip","url":"<link zip>","buildType":"release|debug","tag":"...","flutterVersion":"(opsional)"}
-# Hasil: artifact bernama apk-<jobId> berisi file .apk
+# Dipanggil bot lewat workflow_dispatch. Kontrak input tidak berubah: jobId, userId, payload.
+# payload: {"mode":"zip","url":"<link zip>","buildType":"release|debug","abi":"default|arm64|all","flutterVersion":""}
+# Hasil: artifact apk-<jobId> berisi file .apk
+#
+# Dibuat cepat:
+#  • Versi Flutter dipilih LANGSUNG dari kebutuhan project (tanpa coba-gagal dulu)
+#  • Cache Flutter, pub, dan Gradle antar build
+#  • Hanya ABI arm + arm64 secara bawaan (lebih cepat & APK lebih kecil; abi:"all" untuk semua)
+#  • Gradle diatur paralel + build cache
+#  • Fallback ke versi Flutter lain (maks 2) hanya jika build gagal
+#  • speed:"fast" (tombol ⚡ di bot): hanya arm64 + tanpa R8/shrink (jika didukung versi Flutter-nya)
 
 on:
   workflow_dispatch:
@@ -40,15 +47,15 @@ jobs:
           set -euo pipefail
           URL=$(jq -r '.url // empty' <<<"$PAYLOAD")
           MODE=$(jq -r '.buildType // "release"' <<<"$PAYLOAD")
+          ABI=$(jq -r '.abi // "default"' <<<"$PAYLOAD")
           FV=$(jq -r '.flutterVersion // empty' <<<"$PAYLOAD")
+          SPEED=$(jq -r '.speed // "normal"' <<<"$PAYLOAD")
           [ -n "$URL" ] || { echo "::error::payload.url kosong"; exit 1; }
           case "$MODE" in release|debug) ;; *) MODE=release ;; esac
-          {
-            echo "url=$URL"
-            echo "mode=$MODE"
-            echo "fv=$FV"
-          } >> "$GITHUB_OUTPUT"
-          echo "Mode build: $MODE"
+          case "$ABI" in default|arm64|all) ;; *) ABI=default ;; esac
+          case "$SPEED" in fast) ABI=arm64 ;; *) SPEED=normal ;; esac
+          { echo "url=$URL"; echo "mode=$MODE"; echo "abi=$ABI"; echo "fv=$FV"; echo "speed=$SPEED"; } >> "$GITHUB_OUTPUT"
+          echo "Mode: $MODE | ABI: $ABI | Speed: $SPEED"
 
       - name: Download & extract source
         env:
@@ -66,6 +73,44 @@ jobs:
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
           echo "Project ditemukan di: $APP_DIR"
 
+      - name: Pilih versi Flutter dari kebutuhan project
+        id: detect
+        env:
+          FORCE_VERSION: ${{ steps.p.outputs.fv }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          txt = open(os.path.join(os.environ["APP_DIR"], "pubspec.yaml"), encoding="utf-8", errors="ignore").read()
+
+          def lower_bound(s):
+              m = re.search(r"(\d+)\.(\d+)", s or "")
+              return (int(m.group(1)), int(m.group(2))) if m else None
+
+          dart = None
+          for m in re.finditer(r"^[ \t]+sdk:\s*['\"]?([^'\"\n#]+)", txt, re.M):
+              if re.search(r"\d+\.\d+", m.group(1)):
+                  dart = lower_bound(m.group(1)); break
+          fl = None
+          m = re.search(r"^[ \t]+flutter:\s*['\"]([^'\"\n#]+)", txt, re.M)
+          if m: fl = lower_bound(m.group(1))
+
+          # Dart 3.9 = Flutter 3.35, Dart 3.10+ = Flutter 3.38+
+          need = 0
+          if dart and dart[0] == 3: need = max(need, {9: 35}.get(dart[1], 38 if dart[1] >= 10 else 0))
+          if fl and fl[0] == 3: need = max(need, fl[1])
+
+          forced = os.environ.get("FORCE_VERSION", "").strip()
+          if forced:   tag = forced
+          elif need >= 38: tag = "stable"
+          elif need >= 35: tag = "3.35.7"
+          else:            tag = "3.32.8"
+
+          print(f"Dart SDK minimal: {dart} | Flutter minimal: {fl} -> pakai Flutter {tag}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"tag={tag}\n")
+              f.write(f"fv={'' if tag == 'stable' else tag}\n")
+          PY
+
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -76,91 +121,151 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version: ${{ steps.p.outputs.fv }}
+          flutter-version: ${{ steps.detect.outputs.fv }}
           cache: true
 
-      - name: Flutter pub get
-        run: |
-          set -euo pipefail
-          cd "$APP_DIR"
-          flutter config --no-analytics >/dev/null 2>&1 || true
-          # Kalau folder android hilang dari ZIP, generate ulang
-          if [ ! -d android ]; then
-            NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d "\"'")
-            flutter create --platforms=android --project-name "$NAME" .
-          fi
-          flutter pub get
+      - name: Cache pub
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('work/src/**/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
 
-      - name: Upgrade Gradle wrapper (kalau terlalu lama)
-        run: |
-          set -euo pipefail
-          cd "$APP_DIR"
-          WP=android/gradle/wrapper/gradle-wrapper.properties
-          MIN="8.14.3"
-          if [ -f "$WP" ]; then
-            CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$WP" | head -1 | sed 's/gradle-//')
-            echo "Gradle project: ${CUR:-tidak terdeteksi}"
-            if [ -n "$CUR" ] && [ "$(printf '%s\n%s\n' "$CUR" "$MIN" | sort -V | head -1)" != "$MIN" ]; then
-              sed -i -E "s#gradle-[0-9]+(\.[0-9]+)*-(all|bin)\.zip#gradle-${MIN}-all.zip#" "$WP"
-              echo "Gradle dinaikkan ke $MIN"
-            fi
-          fi
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ steps.detect.outputs.tag }}-${{ github.run_id }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ steps.detect.outputs.tag }}-
+            gradle-${{ runner.os }}-
 
-      - name: Opt-out DSL baru AGP 9 (kompatibel dengan plugin Flutter)
+      - name: Optimasi Gradle (paralel + build cache)
         run: |
-          set -euo pipefail
-          cd "$APP_DIR"
-          GP=android/gradle.properties
-          mkdir -p android && touch "$GP"
-          if grep -q '^android\.newDsl=' "$GP"; then
-            sed -i 's/^android\.newDsl=.*/android.newDsl=false/' "$GP"
-          else
-            printf '\nandroid.newDsl=false\n' >> "$GP"
-          fi
-          echo "== android/gradle.properties =="
-          cat "$GP"
+          mkdir -p ~/.gradle
+          cat >> ~/.gradle/gradle.properties <<'PROPS'
+          org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.configureondemand=true
+          kotlin.daemon.jvmargs=-Xmx2g
+          PROPS
 
-      - name: Build APK (Flutter stable)
-        id: build1
-        continue-on-error: true
+      - name: Build APK
         env:
           BUILD_MODE: ${{ steps.p.outputs.mode }}
-        run: |
-          set -euo pipefail
-          cd "$APP_DIR"
-          flutter build apk "--$BUILD_MODE" --no-tree-shake-icons --android-skip-build-dependency-validation 2>&1 | tee "$GITHUB_WORKSPACE/build1.log"
-
-      - name: Build APK (fallback Flutter lama)
-        if: steps.build1.outcome == 'failure'
-        env:
-          BUILD_MODE: ${{ steps.p.outputs.mode }}
+          ABI: ${{ steps.p.outputs.abi }}
+          SPEED: ${{ steps.p.outputs.speed }}
+          CHOSEN: ${{ steps.detect.outputs.tag }}
         run: |
           set +e
-          cd "$APP_DIR"
-          summary() {
-            echo "=== Error build utama (Flutter stable) ==="
-            grep -E -A8 "What went wrong|Error:|error:" "$GITHUB_WORKSPACE/build1.log" | head -30
-          }
-          for V in 3.35.7 3.32.8 3.29.3; do
-            echo "::group::Coba Flutter $V"
-            D="$RUNNER_TEMP/flutter-$V"
-            if git clone --depth 1 -b "$V" https://github.com/flutter/flutter.git "$D" >/dev/null 2>&1; then
-              export PATH="$D/bin:$PATH"
-              flutter config --no-analytics >/dev/null 2>&1
-              rm -rf .dart_tool build
-              if flutter pub get && flutter build apk "--$BUILD_MODE" --no-tree-shake-icons; then
-                echo "::endgroup::"
-                echo "Berhasil dengan Flutter $V"
-                exit 0
-              fi
+          case "$ABI" in
+            all)   ABI_ARG="" ;;
+            arm64) ABI_ARG="--target-platform android-arm64" ;;
+            *)     ABI_ARG="--target-platform android-arm,android-arm64" ;;
+          esac
+
+          # Hanya untuk Flutter terbaru: Gradle minimal 8.14.3 + opt-out DSL baru AGP 9
+          prepare_stable() {
+            GP=android/gradle.properties
+            mkdir -p android && touch "$GP"
+            if grep -q '^android\.newDsl=' "$GP"; then
+              sed -i 's/^android\.newDsl=.*/android.newDsl=false/' "$GP"
             else
-              echo "Gagal clone Flutter $V"
+              printf '\nandroid.newDsl=false\n' >> "$GP"
             fi
+            WP=android/gradle/wrapper/gradle-wrapper.properties
+            MIN="8.14.3"
+            if [ -f "$WP" ]; then
+              CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$WP" | head -1 | sed 's/gradle-//')
+              if [ -n "$CUR" ] && [ "$(printf '%s\n%s\n' "$CUR" "$MIN" | sort -V | head -1)" != "$MIN" ]; then
+                sed -i -E "s#gradle-[0-9]+(\.[0-9]+)*-(all|bin)\.zip#gradle-${MIN}-all.zip#" "$WP"
+                echo "Gradle dinaikkan ke $MIN"
+              fi
+            fi
+          }
+
+          build_attempt() {
+            local V="$1"
+            echo "::group::Build dengan Flutter $V"
+            (
+              set -e
+              cd "$APP_DIR"
+              EXTRA=""
+              flutter --version
+              flutter config --no-analytics >/dev/null 2>&1 || true
+              if [ ! -d android ]; then
+                NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}' | tr -d "\"'")
+                flutter create --platforms=android --project-name "$NAME" .
+              fi
+              # Opsi AGP lama yang sudah DIHAPUS bikin build error di AGP baru
+              # ("The option 'android.enableDexingArtifactTransform' is deprecated ... removed in 8.3")
+              if [ -f android/gradle.properties ]; then
+                sed -i -E '/^[[:space:]]*android\.(enableDexingArtifactTransform(\.desugaring)?|enableD8(\.desugaring)?|enableR8(\.libraries)?|enableIncrementalDesugaring|enableBuildCache|enableAapt2|useDeprecatedNdk)[[:space:]]*=/d' android/gradle.properties
+              fi
+              rm -rf build .dart_tool
+              if [ "$V" = "stable" ]; then
+                prepare_stable
+                EXTRA="--android-skip-build-dependency-validation"
+              fi
+              flutter pub get
+              # Mode cepat: lewati R8/shrink kalau versi Flutter ini mendukung flagnya
+              SHRINK_ARG=""
+              if [ "$SPEED" = "fast" ] && [ "$BUILD_MODE" = "release" ] && flutter build apk -h 2>/dev/null | grep -q -- '--no-shrink'; then
+                SHRINK_ARG="--no-shrink"
+              fi
+              flutter build apk "--$BUILD_MODE" --no-tree-shake-icons $ABI_ARG $SHRINK_ARG $EXTRA
+            ) 2>&1 | tee "$GITHUB_WORKSPACE/build_$V.log"
+            local rc=${PIPESTATUS[0]}
             echo "::endgroup::"
-          done
-          summary
-          echo "::error::Semua percobaan build gagal"
-          exit 1
+            return $rc
+          }
+
+          # Kalau gagal karena opsi Gradle usang yang belum ada di daftar, hapus otomatis lalu ulangi
+          build_one() {
+            local V="$1" tries=0 rc OPTS o
+            while true; do
+              build_attempt "$V"; rc=$?
+              [ $rc -eq 0 ] && return 0
+              OPTS=$(grep -oE "The option '[^']+' is deprecated" "$GITHUB_WORKSPACE/build_$V.log" 2>/dev/null | sed -E "s/The option '([^']+)'.*/\1/" | sort -u)
+              if [ -z "$OPTS" ] || [ $tries -ge 2 ]; then return $rc; fi
+              tries=$((tries+1))
+              for o in $OPTS; do
+                echo "Menghapus opsi Gradle usang: $o"
+                sed -i -E "/^[[:space:]]*$(printf '%s' "$o" | sed 's/\./\\./g')[[:space:]]*=/d" "$APP_DIR/android/gradle.properties"
+              done
+            done
+          }
+
+          build_one "$CHOSEN"; rc=$?
+
+          if [ $rc -ne 0 ]; then
+            n=0
+            for V in 3.35.7 3.32.8 3.29.3 stable; do
+              [ "$V" = "$CHOSEN" ] && continue
+              [ $n -ge 2 ] && break
+              n=$((n+1))
+              D="$RUNNER_TEMP/flutter-$V"
+              if ! git clone --depth 1 -b "$V" https://github.com/flutter/flutter.git "$D" >/dev/null 2>&1; then
+                echo "Gagal mengambil Flutter $V, lewati"
+                continue
+              fi
+              export PATH="$D/bin:$PATH"
+              build_one "$V"; rc=$?
+              [ $rc -eq 0 ] && break
+            done
+          fi
+
+          if [ $rc -ne 0 ]; then
+            for f in "$GITHUB_WORKSPACE"/build_*.log; do
+              echo "=== Ringkasan error: $(basename "$f") ==="
+              grep -E -B1 -A8 "What went wrong|FAILURE:|Error:|error:" "$f" | tail -30
+            done
+            echo "::error::Semua percobaan build gagal"
+            exit 1
+          fi
 
       - name: Kumpulkan APK
         run: |
